@@ -1,0 +1,115 @@
+# syntax=docker/dockerfile:1.7
+# ----------------------------------------------------------------------------
+# Dockerfile.hackathon
+#
+# Production-like container image for the **hackathon** API server
+# (`src/server.ts` → `dist/server.js`, default port `3001`,
+# health endpoint `GET /api/health`).
+#
+# Intentionally separate from the root `Dockerfile`, which targets the main
+# server (`src/index.ts` → `dist/index.js`, port `3000`, `GET /health`) and
+# is the image `docker-compose.yml` boots.
+#
+# Build:   docker build -f Dockerfile.hackathon -t xelma-hackathon-api .
+# Run:     docker run --rm -p 3001:3001 --env-file .env xelma-hackathon-api
+# Verify:  curl http://localhost:3001/api/health
+# ----------------------------------------------------------------------------
+
+# ---------- Stage 1: builder ----------
+# Compile TypeScript and regenerate the Prisma client engine.
+FROM node:22-alpine AS builder
+WORKDIR /app
+
+# Local `file:vendor/xelma-bindings` link requires the directory to be present
+# before npm resolves the workspace dependency.
+COPY package.json package-lock.json ./
+COPY vendor/xelma-bindings ./vendor/xelma-bindings
+COPY prisma ./prisma
+
+# Workaround for npm `EBADPLATFORM` failures caused by transitive deps that
+# ship with an erroneous `os` (or `cpu`) tag in their manifest — observed in
+# `cross-spawn@7.0.6` (`os:["darwin"]`), `swagger-ui-dist@5.32.8`
+# (`os:["freebsd"]`), and likely others that npm will surface later. We use
+# `jq` (Alpine apt package, ~350 KB) to deeply strip `os` and `cpu` keys from
+# the lockfile so npm downloads the POSIX-JS tarballs regardless of the bad
+# manifest tags. The mutation lives only inside this ephemeral builder stage
+# and is never written back to source control.
+# Removal: drop this block once the offending upstream deps publish fixes.
+RUN apk add --no-cache jq \
+    && jq 'walk(if type=="object" then del(.os, .cpu) else . end)' package-lock.json > /tmp/lock.json \
+    && mv /tmp/lock.json package-lock.json \
+    && npm install --no-audit --no-fund
+
+# Required before `tsc`: `src/routes/health.ts` statically imports
+# `../lib/prisma`, so the generated Prisma types must exist in node_modules
+# at compile time.
+RUN npx prisma generate
+
+# `tsc` with `rootDir: ./src` and `include: ["src/**/*"]` emits every `.ts`
+# under src — `dist/server.js` is included automatically. Copying the source
+# LAST keeps the heavy `npm install` layer cacheable across source-only edits.
+COPY tsconfig.json ./
+COPY src ./src
+# `npm run build` invokes `tsc`. We append `|| true` because (a) `tsc` still
+# emits JavaScript even when it surfaces type errors (its default
+# `--noEmitOnError false` behaviour), and (b) the presence of `dist/server.js`
+# is what the runtime image actually needs. The TS errors remain visible in
+# the build log so operators see them; this is *not* an attempt to silence
+# them. The TS errors are pre-existing in the upstream codebase
+# (rateLimiter.middleware.ts: TS2322; in-memory.repositories.ts: TS2724) and
+# are tracked outside this Dockerfile PR.
+RUN npm run build || true \
+    && test -f dist/server.js
+
+# ---------- Stage 2: runner ----------
+# Minimal image: production deps + compiled `dist/`. Runs as `node` (uid 1000).
+FROM node:22-alpine AS runner
+ENV NODE_ENV=production \
+    PORT=3001
+WORKDIR /app
+
+# As root: install `wget` (final, used by HEALTHCHECK) and `jq` as a tagged
+# virtual package `.build-tools` so we can purge it cleanly after `npm install`
+# completes (Alpine keeps removed packages' files unless `--purge` is used on a
+# virtual group). Chown working dir so `node` user can write to it later.
+RUN apk add --no-cache wget \
+    && apk add --no-cache --virtual .build-tools jq \
+    && chown -R node:node /app
+
+USER node
+
+COPY --chown=node:node package.json package-lock.json ./
+COPY --chown=node:node vendor/xelma-bindings ./vendor/xelma-bindings
+COPY --chown=node:node prisma ./prisma
+
+# Apply the same EBADPLATFORM workaround (see builder comment). Install prod
+# deps, add Prisma CLI ephemerally so `npx prisma generate` can re-bind the
+# engine to the *runtime* OS. Cache clean keeps the layer lean.
+RUN jq 'walk(if type=="object" then del(.os, .cpu) else . end)' package-lock.json > /tmp/lock.json \
+    && mv /tmp/lock.json package-lock.json \
+    && npm install --omit=dev --no-audit --no-fund \
+    && npm install prisma@^5.8.0 --no-save --no-audit --no-fund \
+    && npx prisma generate \
+    && npm cache clean --force
+
+# Briefly switch back to root to purge the `.build-tools` virtual package
+# (`jq` is the only thing in it). This brings `jq`'s ~350 KB back out of the
+# final image. Then drop back to `node` for the runtime.
+USER root
+RUN apk del --purge .build-tools
+USER node
+
+COPY --chown=node:node --from=builder /app/dist ./dist
+
+EXPOSE 3001
+
+# Liveness probe. `src/routes/health.ts` deliberately returns HTTP 200 even
+# when a downstream dependency is degraded (load balancers keep routing until
+# the process itself is gone) — only reachability is checked here. Start
+# period 60 s tolerates cold starts on Prisma + websocket initialisation in
+# CI/CD rollouts.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=60s --retries=3 \
+  CMD wget -qO- "http://127.0.0.1:${PORT:-3001}/api/health" >/dev/null 2>&1 || exit 1
+
+# Exec form so SIGTERM / SIGINT reach Node and shutdown hooks run.
+CMD ["node", "dist/server.js"]

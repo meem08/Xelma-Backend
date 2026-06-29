@@ -481,6 +481,90 @@ docker compose --profile full up --build
 | Migrations fail on first boot | Run `docker compose logs api`; verify Postgres is healthy with `docker compose ps` |
 | Redis connection warnings | Start with `--profile full` or unset `REDIS_URL` for API-only local mode |
 
+### Hackathon API Container Image (`Dockerfile.hackathon`)
+
+`docker-compose.yml` targets the root `Dockerfile`, which builds the **main**
+server (`src/index.ts` → `dist/index.js`, port `3000`, `GET /health`). A
+dedicated, production-shaped image for the **hackathon** server
+(`src/server.ts` → `dist/server.js`, port `3001`, `GET /api/health`) is
+provided as [`Dockerfile.hackathon`](Dockerfile.hackathon).
+
+Use this image when you want a single artefact for any container platform
+(Render, Fly, Cloud Run, Kubernetes, etc.) that serves the hackathon demo
+API with a multi-stage TypeScript build.
+
+**Build the image**
+
+```bash
+docker build -f Dockerfile.hackathon -t xelma-hackathon-api:latest .
+```
+
+**Run the container**
+
+```bash
+# Copy your env file first (see .env.example) — DATABASE_URL and JWT_SECRET are required
+docker run --rm -d \
+  --name xelma-hackathon-api \
+  -p 3001:3001 \
+  --env-file .env \
+  xelma-hackathon-api:latest
+```
+
+**Verify the container is healthy**
+
+```bash
+# Process alive (returns JSON status, see src/routes/health.ts)
+curl -fsS http://localhost:3001/api/health
+
+# Docker liveness probe (uses HEALTHCHECK inside Dockerfile.hackathon)
+docker inspect --format '{{.State.Health.Status}}' xelma-hackathon-api
+```
+
+**Push to a registry**
+
+```bash
+docker tag xelma-hackathon-api:latest <registry>/xelma/hackathon-api:<tag>
+docker push <registry>/xelma/hackathon-api:<tag>
+```
+
+**Image contents**
+
+| Stage | Base image | Purpose |
+| --- | --- | --- |
+| `builder` | `node:22-alpine` | Install dev deps, generate Prisma client, run `tsc` → `dist/` |
+| `runner` | `node:22-alpine` | Install production deps, copy `dist/`, run `node dist/server.js` as non-root |
+
+The runtime image is intentionally minimal:
+
+- Runs as the unprivileged `node` user (UID 1000)
+- No shell entrypoint — `CMD ["node", "dist/server.js"]` so SIGTERM reaches Node and shutdown hooks run
+- Healthcheck polls `GET /api/health` every 15 s (start period 30 s, 3 retries)
+- Does **not** auto-apply Prisma migrations at boot — the hackathon target is
+  usually a fresh demo DB. Apply migrations in CI/CD before deploying the
+  container, or run `docker exec xelma-hackathon-api npx prisma migrate deploy`
+  against the running image if you need to bootstrap on first start.
+
+**Required environment variables**
+
+| Variable | Purpose | Source |
+| --- | --- | --- |
+| `DATABASE_URL` | PostgreSQL connection string (the hackathon app expects a real DB even in `DATA_MODE=mock`) | `.env` |
+| `JWT_SECRET` | JWT signing key — app refuses to start without it | `.env` |
+| `PORT` | Override the default `3001` | optional |
+| `CLIENT_URL` | CORS-allowed origin | `.env` |
+
+`DATA_MODE=mock` is honoured by the hackathon routes — see
+[Architecture](#architecture) for the full env contract.
+
+**Troubleshooting**
+
+| Symptom | Fix |
+| --- | --- |
+| `npm ci` fails in builder | Ensure `vendor/xelma-bindings/` is intact locally; the `package.json` `file:` link cannot resolve without it |
+| Container exits immediately | Missing `JWT_SECRET` or unreachable Postgres — `docker logs xelma-hackathon-api` will print the preflight error |
+| `/api/health` JSON body has `status: "unhealthy"` | Endpoint always returns HTTP 200 (deliberate, so load balancers keep routing); the JSON `status` field carries `healthy` \| `degraded` \| `unhealthy`. Inspect `services.database.status` etc. in the body |
+| Prisma engine mismatch at runtime | The image runs `npx prisma generate` against the *runner* OS; rebuild after upgrading `prisma` in `package.json` |
+
 ---
 
 ## Environment Setup
